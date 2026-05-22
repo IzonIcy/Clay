@@ -1,0 +1,457 @@
+use crate::bottle;
+use crate::formula::FormulaRecord;
+use crate::lock::acquire_install_lock;
+use crate::prefix::{cache_dir, cellar, ensure_dir, registry_path};
+use crate::registry::{InstallRecord, Registry};
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use rayon::prelude::*;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+pub struct CleanupReport {
+    pub removed_versions: usize,
+    pub removed_links: usize,
+    pub removed_registry_entries: usize,
+}
+
+pub fn prefetch_bottles(
+    records: &[FormulaRecord],
+    prefix: &Path,
+    platform: Option<&str>,
+) -> Result<()> {
+    let platform = platform.ok_or_else(|| anyhow::anyhow!("unable to determine platform"))?;
+    let cache_root = cache_dir(prefix);
+    ensure_dir(&cache_root)?;
+
+    #[derive(Clone)]
+    struct DownloadTask {
+        name: String,
+        url: String,
+        sha256: String,
+        tarball: std::path::PathBuf,
+    }
+
+    let mut tasks = Vec::new();
+    for record in records {
+        let version = record
+            .version()
+            .ok_or_else(|| anyhow::anyhow!("missing stable version"))?;
+        let bottle_file = record.bottle_for_platform(platform)?;
+        let formula_name = record.name.split('/').last().unwrap_or(&record.name);
+        let tarball = bottle::cache_path(&cache_root, formula_name, &version);
+        tasks.push(DownloadTask {
+            name: record.name.clone(),
+            url: bottle_file.url,
+            sha256: bottle_file.sha256,
+            tarball,
+        });
+    }
+
+    tasks.par_iter().try_for_each(|task| -> Result<()> {
+        if !task.tarball.exists() {
+            bottle::download(&task.url, &task.tarball)
+                .with_context(|| format!("downloading {}", task.name))?;
+        }
+        bottle::verify_sha256(&task.tarball, &task.sha256)
+            .with_context(|| format!("verifying {}", task.name))?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+pub fn install_formula(
+    record: &FormulaRecord,
+    prefix: &Path,
+    platform: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let _lock = acquire_install_lock(prefix)?;
+    let platform = platform.ok_or_else(|| anyhow::anyhow!("unable to determine platform"))?;
+    let version = record
+        .version()
+        .ok_or_else(|| anyhow::anyhow!("missing stable version"))?;
+    let bottle_file = record.bottle_for_platform(platform)?;
+    let formula_name = record.name.split('/').last().unwrap_or(&record.name);
+
+    let cellar_root = cellar(prefix);
+    ensure_dir(&cellar_root)?;
+
+    let cache_root = cache_dir(prefix);
+    ensure_dir(&cache_root)?;
+    let tarball = bottle::cache_path(&cache_root, formula_name, &version);
+    if !tarball.exists() {
+        bottle::download(&bottle_file.url, &tarball)?;
+    }
+    bottle::verify_sha256(&tarball, &bottle_file.sha256)?;
+
+    let install_root = cellar_root.join(formula_name);
+    let version_dir = install_root.join(&version);
+    if version_dir.exists() {
+        if force {
+            std::fs::remove_dir_all(&version_dir).with_context(|| {
+                format!("removing existing {}", version_dir.display())
+            })?;
+        } else {
+            bail!("{} {} already installed", record.name, version);
+        }
+    }
+
+    bottle::extract(&tarball, &cellar_root)?;
+    if !version_dir.exists() {
+        bail!(
+            "unexpected bottle layout; missing {}",
+            version_dir.display()
+        );
+    }
+    let links = link_tree(prefix, &version_dir, formula_name)?;
+    let mut registry = Registry::load(&registry_path(prefix))?;
+    registry.upsert(InstallRecord {
+        name: formula_name.to_string(),
+        version,
+        platform: platform.to_string(),
+        installed_at: Utc::now().to_rfc3339(),
+        links,
+    });
+    registry.save(&registry_path(prefix))?;
+    Ok(())
+}
+
+pub fn uninstall_formula(name: &str, prefix: &Path) -> Result<()> {
+    let _lock = acquire_install_lock(prefix)?;
+    let cellar_root = cellar(prefix);
+    let install_root = cellar_root.join(name);
+    if !install_root.exists() {
+        bail!("formula '{name}' is not installed");
+    }
+    std::fs::remove_dir_all(&install_root)
+        .with_context(|| format!("removing {}", install_root.display()))?;
+    let registry_path = registry_path(prefix);
+    let mut registry = Registry::load(&registry_path)?;
+    for entry in registry.entries_for(name) {
+        unlink_paths(&entry.links)?;
+    }
+    registry.remove(name);
+    registry.save(&registry_path)?;
+    unlink_links_for_formula(prefix, name)?;
+    Ok(())
+}
+
+pub fn list_installed(prefix: &Path) -> Result<Vec<String>> {
+    let registry = Registry::load(&registry_path(prefix))?;
+    if !registry.installs.is_empty() {
+        let mut names: Vec<String> = registry.installs.iter().map(|r| r.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        return Ok(names);
+    }
+    list_installed_from_cellar(prefix)
+}
+
+pub fn list_installed_versions(prefix: &Path, name: &str) -> Result<Vec<String>> {
+    let registry = Registry::load(&registry_path(prefix))?;
+    let entries = registry.entries_for(name);
+    if !entries.is_empty() {
+        let mut versions: Vec<String> = entries.into_iter().map(|e| e.version).collect();
+        versions.sort();
+        return Ok(versions);
+    }
+    list_versions_from_cellar(prefix, name)
+}
+
+pub fn list_installed_with_versions(prefix: &Path) -> Result<Vec<(String, Vec<String>)>> {
+    let registry = Registry::load(&registry_path(prefix))?;
+    if !registry.installs.is_empty() {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for entry in registry.installs {
+            map.entry(entry.name)
+                .or_default()
+                .push(entry.version);
+        }
+        let mut out: Vec<(String, Vec<String>)> = map
+            .into_iter()
+            .map(|(name, mut versions)| {
+                versions.sort();
+                (name, versions)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok(out);
+    }
+
+    let mut out = Vec::new();
+    for name in list_installed_from_cellar(prefix)? {
+        let versions = list_versions_from_cellar(prefix, &name)?;
+        out.push((name, versions));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+pub fn link_formula(prefix: &Path, name: &str, version: Option<&str>) -> Result<usize> {
+    let _lock = acquire_install_lock(prefix)?;
+    let version = resolve_version(prefix, name, version)?;
+    let version_dir = cellar(prefix).join(name).join(&version);
+    if !version_dir.exists() {
+        bail!("{} {} is not installed", name, version);
+    }
+    let new_links = link_tree(prefix, &version_dir, name)?;
+    let mut registry = Registry::load(&registry_path(prefix))?;
+    let mut matched = false;
+    for entry in registry.installs.iter_mut() {
+        if entry.name == name && entry.version == version {
+            merge_links(&mut entry.links, &new_links);
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        registry.installs.push(InstallRecord {
+            name: name.to_string(),
+            version: version.clone(),
+            platform: "unknown".to_string(),
+            installed_at: Utc::now().to_rfc3339(),
+            links: new_links.clone(),
+        });
+    }
+    registry.save(&registry_path(prefix))?;
+    Ok(new_links.len())
+}
+
+pub fn unlink_formula(prefix: &Path, name: &str, version: Option<&str>) -> Result<usize> {
+    let _lock = acquire_install_lock(prefix)?;
+    let registry_path = registry_path(prefix);
+    let mut registry = Registry::load(&registry_path)?;
+    let mut removed = 0usize;
+    if !registry.installs.is_empty() {
+        for entry in registry.installs.iter_mut() {
+            let matches_name = entry.name == name;
+            let matches_version = version.map(|v| v == entry.version).unwrap_or(true);
+            if matches_name && matches_version {
+                removed += unlink_paths(&entry.links)?;
+                entry.links.clear();
+            }
+        }
+        registry.save(&registry_path)?;
+        return Ok(removed);
+    }
+    removed += unlink_links_for_formula(prefix, name)?;
+    Ok(removed)
+}
+
+pub fn cleanup(prefix: &Path) -> Result<CleanupReport> {
+    let _lock = acquire_install_lock(prefix)?;
+    let mut removed_versions = 0usize;
+    let mut removed_links = 0usize;
+    let mut removed_registry_entries = 0usize;
+    let cellar_root = cellar(prefix);
+    let registry_path = registry_path(prefix);
+    let mut registry = Registry::load(&registry_path)?;
+
+    for formula in list_installed_from_cellar(prefix)? {
+        let mut versions = list_versions_from_cellar(prefix, &formula)?;
+        if versions.len() <= 1 {
+            continue;
+        }
+        versions.sort();
+        let keep = versions.pop().unwrap_or_default();
+        for version in versions {
+            let version_path = cellar_root.join(&formula).join(&version);
+            if version_path.exists() {
+                std::fs::remove_dir_all(&version_path).with_context(|| {
+                    format!("removing {}", version_path.display())
+                })?;
+                removed_versions += 1;
+            }
+            let before = registry.installs.len();
+            registry
+                .installs
+                .retain(|item| !(item.name == formula && item.version == version));
+            removed_registry_entries += before - registry.installs.len();
+        }
+
+        let before = registry.installs.len();
+        registry
+            .installs
+            .retain(|item| !(item.name == formula && item.version != keep));
+        removed_registry_entries += before - registry.installs.len();
+    }
+
+    let before = registry.installs.len();
+    registry.installs.retain(|item| {
+        cellar_root.join(&item.name).join(&item.version).exists()
+    });
+    removed_registry_entries += before - registry.installs.len();
+    registry.save(&registry_path)?;
+
+    removed_links += remove_broken_links(prefix)?;
+
+    Ok(CleanupReport {
+        removed_versions,
+        removed_links,
+        removed_registry_entries,
+    })
+}
+
+fn link_tree(prefix: &Path, version_dir: &Path, formula: &str) -> Result<Vec<std::path::PathBuf>> {
+    let mut links = Vec::new();
+    let needle = format!("Cellar/{formula}");
+    for dir in ["bin", "lib", "include", "share"] {
+        let from_dir = version_dir.join(dir);
+        if !from_dir.exists() {
+            continue;
+        }
+        let to_dir = prefix.join(dir);
+        ensure_dir(&to_dir)?;
+        for entry in std::fs::read_dir(from_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let link_path = to_dir.join(file_name);
+            if link_path.exists() {
+                if let Ok(target) = std::fs::read_link(&link_path) {
+                    if target.to_string_lossy().contains(&needle) {
+                        std::fs::remove_file(&link_path).with_context(|| {
+                            format!("removing link {}", link_path.display())
+                        })?;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            #[cfg(target_family = "unix")]
+            std::os::unix::fs::symlink(&path, &link_path)
+                .with_context(|| format!("linking {}", link_path.display()))?;
+            links.push(link_path);
+        }
+    }
+    Ok(links)
+}
+
+fn unlink_paths(paths: &[std::path::PathBuf]) -> Result<usize> {
+    let mut removed = 0usize;
+    for path in paths {
+        if path.exists() {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing link {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn list_installed_from_cellar(prefix: &Path) -> Result<Vec<String>> {
+    let cellar_root = cellar(prefix);
+    if !cellar_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut installed = Vec::new();
+    for entry in std::fs::read_dir(cellar_root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            installed.push(name);
+        }
+    }
+    installed.sort();
+    Ok(installed)
+}
+
+fn list_versions_from_cellar(prefix: &Path, name: &str) -> Result<Vec<String>> {
+    let cellar_root = cellar(prefix);
+    let install_root = cellar_root.join(name);
+    if !install_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut versions = Vec::new();
+    for entry in std::fs::read_dir(install_root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            versions.push(name);
+        }
+    }
+    versions.sort();
+    Ok(versions)
+}
+
+fn unlink_links_for_formula(prefix: &Path, formula: &str) -> Result<usize> {
+    let mut removed = 0usize;
+    let needle = format!("Cellar/{formula}");
+    for dir in ["bin", "lib", "include", "share"] {
+        let root = prefix.join(dir);
+        if !root.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Ok(target) = std::fs::read_link(&path) {
+                if target.to_string_lossy().contains(&needle) {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing link {}", path.display()))?;
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_broken_links(prefix: &Path) -> Result<usize> {
+    let mut removed = 0usize;
+    for dir in ["bin", "lib", "include", "share"] {
+        let root = prefix.join(dir);
+        if !root.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            let target = std::fs::read_link(&path)?;
+            if !target.exists() {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing link {}", path.display()))?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn merge_links(existing: &mut Vec<PathBuf>, new_links: &[PathBuf]) {
+    let mut seen: HashSet<PathBuf> = existing.iter().cloned().collect();
+    for link in new_links {
+        if seen.insert(link.clone()) {
+            existing.push(link.clone());
+        }
+    }
+}
+
+fn resolve_version(prefix: &Path, name: &str, version: Option<&str>) -> Result<String> {
+    if let Some(version) = version {
+        return Ok(version.to_string());
+    }
+    let registry = Registry::load(&registry_path(prefix))?;
+    let mut versions: Vec<String> = registry
+        .entries_for(name)
+        .into_iter()
+        .map(|entry| entry.version)
+        .collect();
+    if versions.is_empty() {
+        versions = list_versions_from_cellar(prefix, name)?;
+    }
+    versions.sort();
+    versions
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no installed versions for {name}"))
+}
