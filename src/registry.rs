@@ -14,6 +14,8 @@ pub struct InstallRecord {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Registry {
     pub installs: Vec<InstallRecord>,
+    #[serde(default)]
+    pub pinned: Vec<String>,
 }
 
 impl Registry {
@@ -60,5 +62,21 @@ impl Registry {
             .collect();
         entries.sort_by(|a, b| a.version.cmp(&b.version));
         entries
+    }
+
+    pub fn pin(&mut self, name: &str) {
+        if !self.pinned.iter().any(|p| p == name) {
+            self.pinned.push(name.to_string());
+            self.pinned.sort();
+            self.pinned.dedup();
+        }
+    }
+
+    pub fn unpin(&mut self, name: &str) {
+        self.pinned.retain(|item| item != name);
+    }
+
+    pub fn is_pinned(&self, name: &str) -> bool {
+        self.pinned.iter().any(|item| item == name)
     }
 }

@@ -73,6 +73,42 @@ pub fn remove_tap(repo: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn update_taps() -> Result<Vec<String>> {
+    let root = default_taps_dir()?;
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut updated = Vec::new();
+    for user_entry in std::fs::read_dir(&root)? {
+        let user_entry = user_entry?;
+        if !user_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let user = user_entry.file_name().to_string_lossy().to_string();
+        for tap_entry in std::fs::read_dir(user_entry.path())? {
+            let tap_entry = tap_entry?;
+            if !tap_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = tap_entry.file_name().to_string_lossy().to_string();
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(tap_entry.path())
+                .arg("pull")
+                .arg("--ff-only")
+                .status()
+                .context("git pull failed")?;
+            if !status.success() {
+                bail!("git pull failed for {user}/{name}");
+            }
+            let tap_name = name.strip_prefix("homebrew-").unwrap_or(&name);
+            updated.push(format!("{user}/{tap_name}"));
+        }
+    }
+    updated.sort();
+    Ok(updated)
+}
+
 fn default_taps_dir() -> Result<PathBuf> {
     let prefix = crate::prefix::default_prefix()?;
     Ok(taps_dir(&prefix))

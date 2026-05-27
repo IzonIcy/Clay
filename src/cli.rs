@@ -2,15 +2,17 @@ use crate::cache::clean_cache;
 use crate::doctor::run_doctor;
 use crate::formula::{FormulaIndex, FormulaRecord};
 use crate::install::{
-    cleanup, install_formula, link_formula, list_installed_versions, list_installed_with_versions,
-    prefetch_bottles, unlink_formula, uninstall_formula,
+    cleanup, install_formula, is_installed, link_formula, list_installed_versions,
+    list_installed_with_versions, prefetch_bottles, unlink_formula, uninstall_formula,
 };
-use crate::prefix::{default_platform, default_prefix};
+use crate::prefix::{default_platform, default_prefix, registry_path};
+use crate::registry::Registry;
 use crate::tap::{
-    add_tap, list_taps, remove_tap, tap_formula_record, tap_formula_record_with_brew,
+    add_tap, list_taps, remove_tap, tap_formula_record, tap_formula_record_with_brew, update_taps,
 };
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Parser, Debug)]
 #[command(name = "clay")]
@@ -28,6 +30,14 @@ enum Commands {
         platform: Option<String>,
         #[arg(long, default_value_t = false)]
         force: bool,
+        #[arg(long, default_value_t = false)]
+        only_deps: bool,
+        #[arg(long, default_value_t = false)]
+        skip_recommended: bool,
+        #[arg(long, default_value_t = false)]
+        build_from_source: bool,
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
     },
     Uninstall {
         formula: String,
@@ -47,6 +57,8 @@ enum Commands {
         formula: String,
         #[arg(long)]
         version: Option<String>,
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
     },
     Unlink {
         formula: String,
@@ -54,6 +66,7 @@ enum Commands {
         version: Option<String>,
     },
     Cleanup,
+    Update,
     Search {
         query: String,
         #[arg(long, default_value_t = 25)]
@@ -75,6 +88,12 @@ enum Commands {
         command: CacheCommands,
     },
     Doctor,
+    Pin {
+        formula: String,
+    },
+    Unpin {
+        formula: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -82,6 +101,7 @@ enum TapCommands {
     Add { repo: String },
     List,
     Remove { repo: String },
+    Update,
 }
 
 #[derive(Subcommand, Debug)]
@@ -96,20 +116,38 @@ impl Cli {
                 formula,
                 platform,
                 force,
+                only_deps,
+                skip_recommended,
+                build_from_source,
+                overwrite,
             } => {
                 let platform = platform.or_else(default_platform);
                 let prefix = default_prefix()?;
-                let formula_record = FormulaIndex::fetch()?.get(&formula).or_else(|_| {
-                    let tap = tap_formula_record(&formula)?;
-                    let brew = if tap.is_none() {
-                        tap_formula_record_with_brew(&formula)?
-                    } else {
-                        None
-                    };
-                    tap.or(brew)
-                        .ok_or_else(|| anyhow::anyhow!("formula '{formula}' not found in core or taps"))
-                })?;
-                install_formula(&formula_record, &prefix, platform.as_deref(), force)?;
+                let index = FormulaIndex::load(&prefix)?;
+                let mut resolver = FormulaResolver::new(&index);
+                let root = resolver.resolve(&formula)?;
+                let plan = build_install_plan(&root, &mut resolver, !skip_recommended)?;
+                let root_name = root.name.clone();
+                for record in plan {
+                    if only_deps && record.name == root_name {
+                        continue;
+                    }
+                    let name = formula_name(&record);
+                    let already_installed = is_installed(&prefix, name)?;
+                    let is_root = record.name == root_name;
+                    let should_force = force && is_root;
+                    if already_installed && !should_force {
+                        continue;
+                    }
+                    install_formula(
+                        &record,
+                        &prefix,
+                        platform.as_deref(),
+                        should_force,
+                        build_from_source,
+                        overwrite,
+                    )?;
+                }
             }
             Commands::Uninstall { formula } => {
                 let prefix = default_prefix()?;
@@ -135,23 +173,14 @@ impl Cli {
             }
             Commands::Outdated => {
                 let prefix = default_prefix()?;
-                let index = FormulaIndex::fetch()?;
+                let index = FormulaIndex::load(&prefix)?;
                 for name in crate::install::list_installed(&prefix)? {
                     let versions = list_installed_versions(&prefix, &name)?;
                     if versions.is_empty() {
                         continue;
                     }
                     let installed = versions.last().cloned().unwrap_or_default();
-                    let formula = index.get(&name).or_else(|_| {
-                        let tap = tap_formula_record(&name)?;
-                        let brew = if tap.is_none() {
-                            tap_formula_record_with_brew(&name)?
-                        } else {
-                            None
-                        };
-                        tap.or(brew)
-                            .ok_or_else(|| anyhow::anyhow!("formula '{name}' not found in core or taps"))
-                    })?;
+                    let formula = resolve_formula_record(&index, &name)?;
                     if let Some(latest) = formula.version() {
                         if installed != latest {
                             println!("{} {} -> {}", name, installed, latest);
@@ -161,28 +190,26 @@ impl Cli {
             }
             Commands::Upgrade { formula } => {
                 let prefix = default_prefix()?;
-                let index = FormulaIndex::fetch()?;
+                let index = FormulaIndex::load(&prefix)?;
+                let registry = Registry::load(&registry_path(&prefix))?;
                 let targets = if let Some(name) = formula {
                     vec![name]
                 } else {
                     crate::install::list_installed(&prefix)?
                 };
                 for name in targets {
-                    let formula_record = index.get(&name).or_else(|_| {
-                        let tap = tap_formula_record(&name)?;
-                        let brew = if tap.is_none() {
-                            tap_formula_record_with_brew(&name)?
-                        } else {
-                            None
-                        };
-                        tap.or(brew)
-                            .ok_or_else(|| anyhow::anyhow!("formula '{name}' not found in core or taps"))
-                    })?;
+                    if registry.is_pinned(&name) {
+                        println!("{} is pinned; skipping upgrade", name);
+                        continue;
+                    }
+                    let formula_record = resolve_formula_record(&index, &name)?;
                     install_formula(
                         &formula_record,
                         &prefix,
                         default_platform().as_deref(),
                         true,
+                        false,
+                        false,
                     )?;
                 }
             }
@@ -191,26 +218,21 @@ impl Cli {
                     bail!("no formula names provided");
                 }
                 let prefix = default_prefix()?;
-                let index = FormulaIndex::fetch()?;
+                let index = FormulaIndex::load(&prefix)?;
                 let mut records = Vec::new();
                 for name in formulas {
-                    let formula_record = index.get(&name).or_else(|_| {
-                        let tap = tap_formula_record(&name)?;
-                        let brew = if tap.is_none() {
-                            tap_formula_record_with_brew(&name)?
-                        } else {
-                            None
-                        };
-                        tap.or(brew)
-                            .ok_or_else(|| anyhow::anyhow!("formula '{name}' not found in core or taps"))
-                    })?;
+                    let formula_record = resolve_formula_record(&index, &name)?;
                     records.push(formula_record);
                 }
                 prefetch_bottles(&records, &prefix, default_platform().as_deref())?;
             }
-            Commands::Link { formula, version } => {
+            Commands::Link {
+                formula,
+                version,
+                overwrite,
+            } => {
                 let prefix = default_prefix()?;
-                let linked = link_formula(&prefix, &formula, version.as_deref())?;
+                let linked = link_formula(&prefix, &formula, version.as_deref(), overwrite)?;
                 println!("linked {linked} entries");
             }
             Commands::Unlink { formula, version } => {
@@ -226,8 +248,14 @@ impl Cli {
                     report.removed_versions, report.removed_links, report.removed_registry_entries
                 );
             }
+            Commands::Update => {
+                let prefix = default_prefix()?;
+                let index = FormulaIndex::update(&prefix)?;
+                println!("updated formula index ({} formulas)", index.formulas().count());
+            }
             Commands::Search { query, limit, desc } => {
-                let index = FormulaIndex::fetch()?;
+                let prefix = default_prefix()?;
+                let index = FormulaIndex::load(&prefix)?;
                 let mut matches = Vec::new();
                 for formula in index.formulas() {
                     let name_hit = formula.name.contains(&query);
@@ -253,21 +281,14 @@ impl Cli {
                 }
             }
             Commands::Info { formula, json } => {
-                let record = FormulaIndex::fetch()?.get(&formula).or_else(|_| {
-                    let tap = tap_formula_record(&formula)?;
-                    let brew = if tap.is_none() {
-                        tap_formula_record_with_brew(&formula)?
-                    } else {
-                        None
-                    };
-                    tap.or(brew)
-                        .ok_or_else(|| anyhow::anyhow!("formula '{formula}' not found in core or taps"))
-                })?;
+                let prefix = default_prefix()?;
+                let index = FormulaIndex::load(&prefix)?;
+                let record = resolve_formula_record(&index, &formula)?;
                 if json {
                     let out = serde_json::to_string_pretty(&record)?;
                     println!("{out}");
                 } else {
-                    print_formula_info(&record);
+                    print_formula_info(&record, &prefix)?;
                 }
             }
             Commands::Tap { command } => match command {
@@ -278,6 +299,14 @@ impl Cli {
                     }
                 }
                 TapCommands::Remove { repo } => remove_tap(&repo)?,
+                TapCommands::Update => {
+                    let updated = update_taps()?;
+                    if updated.is_empty() {
+                        println!("no taps to update");
+                    } else {
+                        println!("updated {} taps", updated.len());
+                    }
+                }
             },
             Commands::Cache { command } => match command {
                 CacheCommands::Clean => {
@@ -289,12 +318,27 @@ impl Cli {
             Commands::Doctor => {
                 run_doctor()?;
             }
+            Commands::Pin { formula } => {
+                let prefix = default_prefix()?;
+                let mut registry = Registry::load(&registry_path(&prefix))?;
+                registry.pin(&formula);
+                registry.save(&registry_path(&prefix))?;
+                println!("pinned {formula}");
+            }
+            Commands::Unpin { formula } => {
+                let prefix = default_prefix()?;
+                let mut registry = Registry::load(&registry_path(&prefix))?;
+                registry.unpin(&formula);
+                registry.save(&registry_path(&prefix))?;
+                println!("unpinned {formula}");
+            }
         }
         Ok(())
     }
 }
 
-fn print_formula_info(record: &FormulaRecord) {
+fn print_formula_info(record: &FormulaRecord, prefix: &std::path::Path) -> Result<()> {
+    let installed = list_installed_versions(prefix, &formula_name(record))?;
     println!("name: {}", record.name);
     if let Some(desc) = &record.desc {
         println!("desc: {}", desc);
@@ -308,4 +352,105 @@ fn print_formula_info(record: &FormulaRecord) {
     if let Some(license) = &record.license {
         println!("license: {}", license);
     }
+    let deps = record.dependencies(false);
+    if !deps.is_empty() {
+        println!("deps: {}", deps.join(", "));
+    }
+    let recommended = record.recommended_dependencies.clone();
+    if !recommended.is_empty() {
+        println!("recommended: {}", recommended.join(", "));
+    }
+    let platforms = record.bottle_platforms();
+    if !platforms.is_empty() {
+        println!("bottles: {}", platforms.join(", "));
+    }
+    if installed.is_empty() {
+        println!("installed: no");
+    } else {
+        println!("installed: {}", installed.join(", "));
+    }
+    Ok(())
+}
+
+fn formula_name(record: &FormulaRecord) -> &str {
+    record.name.split('/').last().unwrap_or(&record.name)
+}
+
+fn resolve_formula_record(index: &FormulaIndex, name: &str) -> Result<FormulaRecord> {
+    index.get(name).or_else(|_| {
+        let tap = tap_formula_record(name)?;
+        let brew = if tap.is_none() {
+            tap_formula_record_with_brew(name)?
+        } else {
+            None
+        };
+        tap.or(brew)
+            .ok_or_else(|| anyhow::anyhow!("formula '{name}' not found in core or taps"))
+    })
+}
+
+struct FormulaResolver<'a> {
+    index: &'a FormulaIndex,
+    cache: HashMap<String, FormulaRecord>,
+}
+
+impl<'a> FormulaResolver<'a> {
+    fn new(index: &'a FormulaIndex) -> Self {
+        Self {
+            index,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, name: &str) -> Result<FormulaRecord> {
+        if let Some(record) = self.cache.get(name) {
+            return Ok(record.clone());
+        }
+        let record = resolve_formula_record(self.index, name)?;
+        self.cache.insert(name.to_string(), record.clone());
+        Ok(record)
+    }
+}
+
+fn build_install_plan(
+    root: &FormulaRecord,
+    resolver: &mut FormulaResolver<'_>,
+    include_recommended: bool,
+) -> Result<Vec<FormulaRecord>> {
+    fn visit(
+        name: &str,
+        resolver: &mut FormulaResolver<'_>,
+        include_recommended: bool,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        ordered: &mut Vec<FormulaRecord>,
+    ) -> Result<()> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if !visiting.insert(name.to_string()) {
+            bail!("dependency cycle detected at {}", name);
+        }
+        let record = resolver.resolve(name)?;
+        for dep in record.dependencies(include_recommended) {
+            visit(&dep, resolver, include_recommended, visiting, visited, ordered)?;
+        }
+        visiting.remove(name);
+        visited.insert(name.to_string());
+        ordered.push(record);
+        Ok(())
+    }
+
+    let mut ordered = Vec::new();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    visit(
+        &root.name,
+        resolver,
+        include_recommended,
+        &mut visiting,
+        &mut visited,
+        &mut ordered,
+    )?;
+    Ok(ordered)
 }
