@@ -2,14 +2,16 @@ use crate::cache::clean_cache;
 use crate::doctor::run_doctor;
 use crate::formula::{FormulaIndex, FormulaRecord};
 use crate::install::{
-    cleanup, install_formula, is_installed, link_formula, list_installed_versions,
-    list_installed_with_versions, prefetch_bottles, unlink_formula, uninstall_formula,
+    autoremove, cleanup, install_formula, is_installed, link_formula, list_installed_versions,
+    list_installed_with_versions, prefetch_bottles, uninstall_formula, unlink_formula,
+    InstallOptions,
 };
 use crate::prefix::{default_platform, default_prefix, registry_path};
 use crate::registry::Registry;
 use crate::tap::{
     add_tap, list_taps, remove_tap, tap_formula_record, tap_formula_record_with_brew, update_taps,
 };
+use crate::version::compare_versions;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
@@ -38,9 +40,13 @@ enum Commands {
         build_from_source: bool,
         #[arg(long, default_value_t = false)]
         overwrite: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     Uninstall {
         formula: String,
+        #[arg(long, default_value_t = false)]
+        ignore_dependencies: bool,
     },
     List {
         #[arg(long)]
@@ -88,6 +94,8 @@ enum Commands {
         command: CacheCommands,
     },
     Doctor,
+    Leaves,
+    Autoremove,
     Pin {
         formula: String,
     },
@@ -120,14 +128,18 @@ impl Cli {
                 skip_recommended,
                 build_from_source,
                 overwrite,
+                dry_run,
             } => {
                 let platform = platform.or_else(default_platform);
                 let prefix = default_prefix()?;
                 let index = FormulaIndex::load(&prefix)?;
                 let mut resolver = FormulaResolver::new(&index);
                 let root = resolver.resolve(&formula)?;
-                let plan = build_install_plan(&root, &mut resolver, !skip_recommended)?;
+                let include_recommended = !skip_recommended;
+                let plan = build_install_plan(&root, &mut resolver, include_recommended)?;
                 let root_name = root.name.clone();
+                let mut install_plan = Vec::new();
+
                 for record in plan {
                     if only_deps && record.name == root_name {
                         continue;
@@ -139,19 +151,35 @@ impl Cli {
                     if already_installed && !should_force {
                         continue;
                     }
+                    install_plan.push((record, is_root, should_force));
+                }
+
+                if dry_run {
+                    print_install_plan(&install_plan, platform.as_deref(), include_recommended);
+                    return Ok(());
+                }
+
+                for (record, is_root, should_force) in install_plan {
                     install_formula(
                         &record,
                         &prefix,
-                        platform.as_deref(),
-                        should_force,
-                        build_from_source,
-                        overwrite,
+                        InstallOptions {
+                            platform: platform.as_deref(),
+                            force: should_force,
+                            build_from_source,
+                            overwrite,
+                            requested: is_root,
+                            dependencies: normalized_dependencies(&record, include_recommended),
+                        },
                     )?;
                 }
             }
-            Commands::Uninstall { formula } => {
+            Commands::Uninstall {
+                formula,
+                ignore_dependencies,
+            } => {
                 let prefix = default_prefix()?;
-                uninstall_formula(&formula, &prefix)?;
+                uninstall_formula(&formula, &prefix, ignore_dependencies)?;
             }
             Commands::List { versions } => {
                 let prefix = default_prefix()?;
@@ -182,7 +210,7 @@ impl Cli {
                     let installed = versions.last().cloned().unwrap_or_default();
                     let formula = resolve_formula_record(&index, &name)?;
                     if let Some(latest) = formula.version() {
-                        if installed != latest {
+                        if compare_versions(&installed, &latest).is_lt() {
                             println!("{} {} -> {}", name, installed, latest);
                         }
                     }
@@ -203,13 +231,22 @@ impl Cli {
                         continue;
                     }
                     let formula_record = resolve_formula_record(&index, &name)?;
+                    let requested = registry
+                        .entries_for(&name)
+                        .iter()
+                        .any(|entry| entry.requested);
+                    let platform = default_platform();
                     install_formula(
                         &formula_record,
                         &prefix,
-                        default_platform().as_deref(),
-                        true,
-                        false,
-                        false,
+                        InstallOptions {
+                            platform: platform.as_deref(),
+                            force: true,
+                            build_from_source: false,
+                            overwrite: false,
+                            requested,
+                            dependencies: normalized_dependencies(&formula_record, true),
+                        },
                     )?;
                 }
             }
@@ -251,7 +288,10 @@ impl Cli {
             Commands::Update => {
                 let prefix = default_prefix()?;
                 let index = FormulaIndex::update(&prefix)?;
-                println!("updated formula index ({} formulas)", index.formulas().count());
+                println!(
+                    "updated formula index ({} formulas)",
+                    index.formulas().count()
+                );
             }
             Commands::Search { query, limit, desc } => {
                 let prefix = default_prefix()?;
@@ -318,6 +358,21 @@ impl Cli {
             Commands::Doctor => {
                 run_doctor()?;
             }
+            Commands::Leaves => {
+                let prefix = default_prefix()?;
+                let registry = Registry::load(&registry_path(&prefix))?;
+                for leaf in registry.leaves() {
+                    println!("{leaf}");
+                }
+            }
+            Commands::Autoremove => {
+                let prefix = default_prefix()?;
+                let report = autoremove(&prefix)?;
+                println!(
+                    "removed {} formulae and {} links",
+                    report.removed_formulae, report.removed_links
+                );
+            }
             Commands::Pin { formula } => {
                 let prefix = default_prefix()?;
                 let mut registry = Registry::load(&registry_path(&prefix))?;
@@ -338,7 +393,7 @@ impl Cli {
 }
 
 fn print_formula_info(record: &FormulaRecord, prefix: &std::path::Path) -> Result<()> {
-    let installed = list_installed_versions(prefix, &formula_name(record))?;
+    let installed = list_installed_versions(prefix, formula_name(record))?;
     println!("name: {}", record.name);
     if let Some(desc) = &record.desc {
         println!("desc: {}", desc);
@@ -372,8 +427,53 @@ fn print_formula_info(record: &FormulaRecord, prefix: &std::path::Path) -> Resul
     Ok(())
 }
 
+fn print_install_plan(
+    plan: &[(FormulaRecord, bool, bool)],
+    platform: Option<&str>,
+    include_recommended: bool,
+) {
+    if plan.is_empty() {
+        println!("Nothing to install.");
+        return;
+    }
+
+    println!("Would install:");
+    for (record, is_root, force) in plan {
+        let version = record.version().unwrap_or_else(|| "unknown".to_string());
+        let marker = if *is_root { "requested" } else { "dependency" };
+        let action = if *force { "reinstall" } else { "install" };
+        println!(
+            "  {} {} ({marker}, {action})",
+            formula_name(record),
+            version
+        );
+
+        let deps = normalized_dependencies(record, include_recommended);
+        if !deps.is_empty() {
+            println!("    deps: {}", deps.join(", "));
+        }
+    }
+
+    if let Some(platform) = platform {
+        println!("Platform: {platform}");
+    } else {
+        println!("Platform: source build or unknown");
+    }
+}
+
+fn normalized_dependencies(record: &FormulaRecord, include_recommended: bool) -> Vec<String> {
+    let mut deps: Vec<String> = record
+        .dependencies(include_recommended)
+        .into_iter()
+        .map(|dep| dep.split('/').next_back().unwrap_or(&dep).to_string())
+        .collect();
+    deps.sort();
+    deps.dedup();
+    deps
+}
+
 fn formula_name(record: &FormulaRecord) -> &str {
-    record.name.split('/').last().unwrap_or(&record.name)
+    record.name.split('/').next_back().unwrap_or(&record.name)
 }
 
 fn resolve_formula_record(index: &FormulaIndex, name: &str) -> Result<FormulaRecord> {
@@ -433,7 +533,14 @@ fn build_install_plan(
         }
         let record = resolver.resolve(name)?;
         for dep in record.dependencies(include_recommended) {
-            visit(&dep, resolver, include_recommended, visiting, visited, ordered)?;
+            visit(
+                &dep,
+                resolver,
+                include_recommended,
+                visiting,
+                visited,
+                ordered,
+            )?;
         }
         visiting.remove(name);
         visited.insert(name.to_string());
@@ -453,4 +560,68 @@ fn build_install_plan(
         &mut ordered,
     )?;
     Ok(ordered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_install_plan, normalized_dependencies, FormulaResolver};
+    use crate::formula::{FormulaIndex, FormulaRecord, Versions};
+
+    fn formula(name: &str, deps: &[&str], recommended: &[&str]) -> FormulaRecord {
+        FormulaRecord {
+            name: name.to_string(),
+            desc: None,
+            homepage: None,
+            license: None,
+            dependencies: deps.iter().map(|dep| dep.to_string()).collect(),
+            recommended_dependencies: recommended.iter().map(|dep| dep.to_string()).collect(),
+            optional_dependencies: Vec::new(),
+            build_dependencies: Vec::new(),
+            test_dependencies: Vec::new(),
+            versions: Some(Versions {
+                stable: Some("1.0".to_string()),
+            }),
+            bottle: None,
+        }
+    }
+
+    fn index(records: Vec<FormulaRecord>) -> FormulaIndex {
+        FormulaIndex::from_records_for_tests(records)
+    }
+
+    #[test]
+    fn install_plan_orders_dependencies_before_root() {
+        let root = formula("root", &["dep-b", "dep-a"], &[]);
+        let index = index(vec![
+            root.clone(),
+            formula("dep-a", &[], &[]),
+            formula("dep-b", &["dep-c"], &[]),
+            formula("dep-c", &[], &[]),
+        ]);
+        let mut resolver = FormulaResolver::new(&index);
+        let plan = build_install_plan(&root, &mut resolver, false).unwrap();
+        let names: Vec<String> = plan.into_iter().map(|record| record.name).collect();
+
+        assert_eq!(names, vec!["dep-a", "dep-c", "dep-b", "root"]);
+    }
+
+    #[test]
+    fn install_plan_can_include_recommended_dependencies() {
+        let root = formula("root", &[], &["recommended"]);
+        let index = index(vec![root.clone(), formula("recommended", &[], &[])]);
+        let mut resolver = FormulaResolver::new(&index);
+        let plan = build_install_plan(&root, &mut resolver, true).unwrap();
+        let names: Vec<String> = plan.into_iter().map(|record| record.name).collect();
+
+        assert_eq!(names, vec!["recommended", "root"]);
+    }
+
+    #[test]
+    fn normalized_dependencies_strip_tap_prefixes() {
+        let record = formula("root", &["homebrew/core/openssl@3", "zlib"], &[]);
+        assert_eq!(
+            normalized_dependencies(&record, false),
+            vec!["openssl@3", "zlib"]
+        );
+    }
 }

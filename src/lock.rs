@@ -13,6 +13,7 @@ pub fn acquire_install_lock(prefix: &Path) -> Result<std::fs::File> {
     }
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)

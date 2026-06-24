@@ -8,6 +8,7 @@ mod lock;
 mod prefix;
 mod registry;
 mod tap;
+mod version;
 
 use anyhow::Result;
 use clap::Parser;

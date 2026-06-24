@@ -3,9 +3,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 const FORMULA_API: &str = "https://formulae.brew.sh/api/formula.json";
 const INDEX_CACHE_NAME: &str = "formula.json";
+const INDEX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24);
+const USER_AGENT: &str = "clay/0.1 (+https://github.com)";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FormulaRecord {
@@ -58,10 +61,7 @@ impl FormulaRecord {
     }
 
     pub fn bottle_for_platform(&self, platform: &str) -> Result<BottleFile> {
-        let bottle = self
-            .bottle
-            .as_ref()
-            .context("no bottle data available")?;
+        let bottle = self.bottle.as_ref().context("no bottle data available")?;
         let stable = bottle
             .stable
             .as_ref()
@@ -100,13 +100,23 @@ pub struct FormulaIndex {
 
 impl FormulaIndex {
     pub fn load(prefix: &Path) -> Result<Self> {
-        if let Ok(cached) = Self::load_cached(prefix) {
+        if let Ok(cached) = Self::load_cached(prefix, true) {
             return Ok(cached);
         }
-        let contents = Self::fetch_remote_raw()?;
-        let index = Self::parse_index(&contents)?;
-        Self::write_cache(prefix, &contents)?;
-        Ok(index)
+
+        match Self::fetch_remote_raw() {
+            Ok(contents) => {
+                let index = Self::parse_index(&contents)?;
+                Self::write_cache(prefix, &contents)?;
+                Ok(index)
+            }
+            Err(err) => {
+                if let Ok(cached) = Self::load_cached(prefix, false) {
+                    return Ok(cached);
+                }
+                Err(err)
+            }
+        }
     }
 
     pub fn update(prefix: &Path) -> Result<Self> {
@@ -127,15 +137,34 @@ impl FormulaIndex {
         self.formulas.values()
     }
 
-    fn load_cached(prefix: &Path) -> Result<Self> {
+    #[cfg(test)]
+    pub fn from_records_for_tests(records: Vec<FormulaRecord>) -> Self {
+        let formulas = records
+            .into_iter()
+            .map(|record| (record.name.clone(), record))
+            .collect();
+        Self { formulas }
+    }
+
+    fn load_cached(prefix: &Path, require_fresh: bool) -> Result<Self> {
         let path = index_cache_path(prefix);
+        if require_fresh && cache_is_stale(&path)? {
+            anyhow::bail!("formula cache is stale");
+        }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("reading formula cache {}", path.display()))?;
         Self::parse_index(&contents)
     }
 
     fn fetch_remote_raw() -> Result<String> {
-        let response = reqwest::blocking::get(FORMULA_API)
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .user_agent(USER_AGENT)
+            .build()
+            .context("building HTTP client")?;
+        let response = client
+            .get(FORMULA_API)
+            .send()
             .context("fetching formula index")?
             .error_for_status()
             .context("formula API response error")?;
@@ -164,4 +193,15 @@ impl FormulaIndex {
 
 fn index_cache_path(prefix: &Path) -> PathBuf {
     cache_dir(prefix).join(INDEX_CACHE_NAME)
+}
+
+fn cache_is_stale(path: &Path) -> Result<bool> {
+    let modified = std::fs::metadata(path)
+        .with_context(|| format!("reading formula cache metadata {}", path.display()))?
+        .modified()
+        .with_context(|| format!("reading formula cache modified time {}", path.display()))?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO);
+    Ok(age > INDEX_MAX_AGE)
 }

@@ -3,6 +3,7 @@ use crate::formula::FormulaRecord;
 use crate::lock::acquire_install_lock;
 use crate::prefix::{cache_dir, cellar, ensure_dir, registry_path};
 use crate::registry::{InstallRecord, Registry};
+use crate::version::compare_versions;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rayon::prelude::*;
@@ -14,6 +15,20 @@ pub struct CleanupReport {
     pub removed_versions: usize,
     pub removed_links: usize,
     pub removed_registry_entries: usize,
+}
+
+pub struct AutoRemoveReport {
+    pub removed_formulae: usize,
+    pub removed_links: usize,
+}
+
+pub struct InstallOptions<'a> {
+    pub platform: Option<&'a str>,
+    pub force: bool,
+    pub build_from_source: bool,
+    pub overwrite: bool,
+    pub requested: bool,
+    pub dependencies: Vec<String>,
 }
 
 pub fn prefetch_bottles(
@@ -39,7 +54,7 @@ pub fn prefetch_bottles(
             .version()
             .ok_or_else(|| anyhow::anyhow!("missing stable version"))?;
         let bottle_file = record.bottle_for_platform(platform)?;
-        let formula_name = record.name.split('/').last().unwrap_or(&record.name);
+        let formula_name = record.name.split('/').next_back().unwrap_or(&record.name);
         let tarball = bottle::cache_path(&cache_root, formula_name, &version);
         tasks.push(DownloadTask {
             name: record.name.clone(),
@@ -65,12 +80,17 @@ pub fn prefetch_bottles(
 pub fn install_formula(
     record: &FormulaRecord,
     prefix: &Path,
-    platform: Option<&str>,
-    force: bool,
-    build_from_source: bool,
-    overwrite: bool,
+    options: InstallOptions<'_>,
 ) -> Result<()> {
     let _lock = acquire_install_lock(prefix)?;
+    let InstallOptions {
+        platform,
+        force,
+        build_from_source,
+        overwrite,
+        requested,
+        dependencies,
+    } = options;
     let platform = match platform {
         Some(platform) => Some(platform),
         None => {
@@ -89,13 +109,20 @@ pub fn install_formula(
         Ok(bottle) => bottle,
         Err(err) => {
             if build_from_source {
-                return install_from_source(record, prefix, force, overwrite)
-                    .with_context(|| format!("building {} from source", record.name));
+                return install_from_source(
+                    record,
+                    prefix,
+                    force,
+                    overwrite,
+                    requested,
+                    dependencies,
+                )
+                .with_context(|| format!("building {} from source", record.name));
             }
             return Err(err);
         }
     };
-    let formula_name = record.name.split('/').last().unwrap_or(&record.name);
+    let formula_name = record.name.split('/').next_back().unwrap_or(&record.name);
     let version = record
         .version()
         .ok_or_else(|| anyhow::anyhow!("missing stable version"))?;
@@ -107,22 +134,27 @@ pub fn install_formula(
     ensure_dir(&cache_root)?;
     let tarball = bottle::cache_path(&cache_root, formula_name, &version);
     if !tarball.exists() {
+        println!("==> Fetching {}", record.name);
         bottle::download(&bottle_file.url, &tarball)?;
     }
-    bottle::verify_sha256(&tarball, &bottle_file.sha256)?;
+    println!("==> Verifying {}", record.name);
+    if let Err(err) = bottle::verify_sha256(&tarball, &bottle_file.sha256) {
+        let _ = std::fs::remove_file(&tarball);
+        return Err(err);
+    }
 
     let install_root = cellar_root.join(formula_name);
     let version_dir = install_root.join(&version);
     if version_dir.exists() {
         if force {
-            std::fs::remove_dir_all(&version_dir).with_context(|| {
-                format!("removing existing {}", version_dir.display())
-            })?;
+            std::fs::remove_dir_all(&version_dir)
+                .with_context(|| format!("removing existing {}", version_dir.display()))?;
         } else {
             bail!("{} {} already installed", record.name, version);
         }
     }
 
+    println!("==> Pouring {} {}", record.name, version);
     bottle::extract(&tarball, &cellar_root)?;
     if !version_dir.exists() {
         bail!(
@@ -130,6 +162,7 @@ pub fn install_formula(
             version_dir.display()
         );
     }
+    println!("==> Linking {}", record.name);
     let links = link_tree(prefix, &version_dir, formula_name, overwrite)?;
     let mut registry = Registry::load(&registry_path(prefix))?;
     registry.upsert(InstallRecord {
@@ -138,22 +171,33 @@ pub fn install_formula(
         platform: platform.unwrap_or("unknown").to_string(),
         installed_at: Utc::now().to_rfc3339(),
         links,
+        dependencies,
+        requested,
     });
     registry.save(&registry_path(prefix))?;
     Ok(())
 }
 
-pub fn uninstall_formula(name: &str, prefix: &Path) -> Result<()> {
+pub fn uninstall_formula(name: &str, prefix: &Path, ignore_dependencies: bool) -> Result<()> {
     let _lock = acquire_install_lock(prefix)?;
     let cellar_root = cellar(prefix);
     let install_root = cellar_root.join(name);
     if !install_root.exists() {
         bail!("formula '{name}' is not installed");
     }
-    std::fs::remove_dir_all(&install_root)
-        .with_context(|| format!("removing {}", install_root.display()))?;
     let registry_path = registry_path(prefix);
     let mut registry = Registry::load(&registry_path)?;
+    if !ignore_dependencies {
+        let dependents = registry.dependents_of(name);
+        if !dependents.is_empty() {
+            bail!(
+                "cannot uninstall {name}; still required by {} (use --ignore-dependencies to force)",
+                dependents.join(", ")
+            );
+        }
+    }
+    std::fs::remove_dir_all(&install_root)
+        .with_context(|| format!("removing {}", install_root.display()))?;
     for entry in registry.entries_for(name) {
         unlink_paths(&entry.links)?;
     }
@@ -179,7 +223,7 @@ pub fn list_installed_versions(prefix: &Path, name: &str) -> Result<Vec<String>>
     let entries = registry.entries_for(name);
     if !entries.is_empty() {
         let mut versions: Vec<String> = entries.into_iter().map(|e| e.version).collect();
-        versions.sort();
+        versions.sort_by(|a, b| compare_versions(a, b));
         return Ok(versions);
     }
     list_versions_from_cellar(prefix, name)
@@ -191,14 +235,12 @@ pub fn list_installed_with_versions(prefix: &Path) -> Result<Vec<(String, Vec<St
         let mut map: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for entry in registry.installs {
-            map.entry(entry.name)
-                .or_default()
-                .push(entry.version);
+            map.entry(entry.name).or_default().push(entry.version);
         }
         let mut out: Vec<(String, Vec<String>)> = map
             .into_iter()
             .map(|(name, mut versions)| {
-                versions.sort();
+                versions.sort_by(|a, b| compare_versions(a, b));
                 (name, versions)
             })
             .collect();
@@ -244,6 +286,8 @@ pub fn link_formula(
             platform: "unknown".to_string(),
             installed_at: Utc::now().to_rfc3339(),
             links: new_links.clone(),
+            dependencies: Vec::new(),
+            requested: true,
         });
     }
     registry.save(&registry_path(prefix))?;
@@ -293,14 +337,13 @@ pub fn cleanup(prefix: &Path) -> Result<CleanupReport> {
         if versions.len() <= 1 {
             continue;
         }
-        versions.sort();
+        versions.sort_by(|a, b| compare_versions(a, b));
         let keep = versions.pop().unwrap_or_default();
         for version in versions {
             let version_path = cellar_root.join(&formula).join(&version);
             if version_path.exists() {
-                std::fs::remove_dir_all(&version_path).with_context(|| {
-                    format!("removing {}", version_path.display())
-                })?;
+                std::fs::remove_dir_all(&version_path)
+                    .with_context(|| format!("removing {}", version_path.display()))?;
                 removed_versions += 1;
             }
             let before = registry.installs.len();
@@ -318,9 +361,9 @@ pub fn cleanup(prefix: &Path) -> Result<CleanupReport> {
     }
 
     let before = registry.installs.len();
-    registry.installs.retain(|item| {
-        cellar_root.join(&item.name).join(&item.version).exists()
-    });
+    registry
+        .installs
+        .retain(|item| cellar_root.join(&item.name).join(&item.version).exists());
     removed_registry_entries += before - registry.installs.len();
     registry.save(&registry_path)?;
 
@@ -330,6 +373,50 @@ pub fn cleanup(prefix: &Path) -> Result<CleanupReport> {
         removed_versions,
         removed_links,
         removed_registry_entries,
+    })
+}
+
+pub fn autoremove(prefix: &Path) -> Result<AutoRemoveReport> {
+    let _lock = acquire_install_lock(prefix)?;
+    let registry_path = registry_path(prefix);
+    let mut registry = Registry::load(&registry_path)?;
+    let cellar_root = cellar(prefix);
+    let mut removed_formulae = 0usize;
+    let mut removed_links = 0usize;
+
+    loop {
+        let leaves: HashSet<String> = registry.leaves().into_iter().collect();
+        let targets: Vec<String> = registry
+            .installs
+            .iter()
+            .filter(|entry| !entry.requested && leaves.contains(&entry.name))
+            .map(|entry| entry.name.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if targets.is_empty() {
+            break;
+        }
+
+        for name in targets {
+            for entry in registry.entries_for(&name) {
+                removed_links += unlink_paths(&entry.links)?;
+            }
+            let install_root = cellar_root.join(&name);
+            if install_root.exists() {
+                std::fs::remove_dir_all(&install_root)
+                    .with_context(|| format!("removing {}", install_root.display()))?;
+            }
+            registry.remove(&name);
+            removed_formulae += 1;
+        }
+    }
+
+    registry.save(&registry_path)?;
+    Ok(AutoRemoveReport {
+        removed_formulae,
+        removed_links,
     })
 }
 
@@ -446,7 +533,7 @@ fn list_versions_from_cellar(prefix: &Path, name: &str) -> Result<Vec<String>> {
             versions.push(name);
         }
     }
-    versions.sort();
+    versions.sort_by(|a, b| compare_versions(a, b));
     Ok(versions)
 }
 
@@ -521,7 +608,7 @@ fn resolve_version(prefix: &Path, name: &str, version: Option<&str>) -> Result<S
     if versions.is_empty() {
         versions = list_versions_from_cellar(prefix, name)?;
     }
-    versions.sort();
+    versions.sort_by(|a, b| compare_versions(a, b));
     versions
         .last()
         .cloned()
@@ -533,8 +620,10 @@ fn install_from_source(
     prefix: &Path,
     force: bool,
     overwrite: bool,
+    requested: bool,
+    dependencies: Vec<String>,
 ) -> Result<()> {
-    let formula_name = record.name.split('/').last().unwrap_or(&record.name);
+    let formula_name = record.name.split('/').next_back().unwrap_or(&record.name);
     let mut cmd = Command::new("brew");
     if force {
         cmd.arg("reinstall");
@@ -553,7 +642,7 @@ fn install_from_source(
     let mut version = record.version().unwrap_or_default();
     if version.is_empty() || !cellar(prefix).join(formula_name).join(&version).exists() {
         let mut versions = list_versions_from_cellar(prefix, formula_name)?;
-        versions.sort();
+        versions.sort_by(|a, b| compare_versions(a, b));
         version = versions
             .last()
             .cloned()
@@ -561,8 +650,13 @@ fn install_from_source(
     }
     let version_dir = cellar(prefix).join(formula_name).join(&version);
     if !version_dir.exists() {
-        bail!("{} {} is not installed after source build", formula_name, version);
+        bail!(
+            "{} {} is not installed after source build",
+            formula_name,
+            version
+        );
     }
+    println!("==> Linking {}", record.name);
     let links = link_tree(prefix, &version_dir, formula_name, overwrite)?;
     let mut registry = Registry::load(&registry_path(prefix))?;
     registry.upsert(InstallRecord {
@@ -571,6 +665,8 @@ fn install_from_source(
         platform: "source".to_string(),
         installed_at: Utc::now().to_rfc3339(),
         links,
+        dependencies,
+        requested,
     });
     registry.save(&registry_path(prefix))?;
     Ok(())

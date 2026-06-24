@@ -119,7 +119,7 @@ pub fn tap_formula_record(name: &str) -> Result<Option<FormulaRecord>> {
     if !root.exists() {
         return Ok(None);
     }
-    let name_stem = name.split('/').last().unwrap_or(name);
+    let name_stem = name.split('/').next_back().unwrap_or(name);
     for user_entry in std::fs::read_dir(root)? {
         let user_entry = user_entry?;
         if !user_entry.file_type()?.is_dir() {
@@ -136,12 +136,10 @@ pub fn tap_formula_record(name: &str) -> Result<Option<FormulaRecord>> {
             }
             let json_path = formula_dir.join(format!("{name_stem}.json"));
             if json_path.exists() {
-                let contents = std::fs::read_to_string(&json_path).with_context(|| {
-                    format!("reading tap formula {}", json_path.display())
-                })?;
-                let record = serde_json::from_str(&contents).with_context(|| {
-                    format!("parsing tap formula {}", json_path.display())
-                })?;
+                let contents = std::fs::read_to_string(&json_path)
+                    .with_context(|| format!("reading tap formula {}", json_path.display()))?;
+                let record = serde_json::from_str(&contents)
+                    .with_context(|| format!("parsing tap formula {}", json_path.display()))?;
                 return Ok(Some(record));
             }
         }

@@ -8,7 +8,10 @@ pub fn run_doctor() -> Result<()> {
     let prefix = default_prefix()?;
     let platform = default_platform();
     println!("prefix: {}", prefix.display());
-    println!("platform: {}", platform.unwrap_or_else(|| "unknown".to_string()));
+    println!(
+        "platform: {}",
+        platform.unwrap_or_else(|| "unknown".to_string())
+    );
     println!("cache: {}", cache_dir(&prefix).display());
     println!("taps: {}", taps_dir(&prefix).display());
     println!("registry: {}", registry_path(&prefix).display());
@@ -34,6 +37,7 @@ pub fn run_doctor() -> Result<()> {
         }
         let _file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&write_test)?;
         let _ = std::fs::remove_file(&write_test);
