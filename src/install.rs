@@ -647,9 +647,7 @@ fn install_from_source(
     }
     let version_dir = cellar(prefix).join(formula_name).join(&version);
     if !version_dir.exists() {
-        bail!(
-            "{formula_name} {version} is not installed after source build"
-        );
+        bail!("{formula_name} {version} is not installed after source build");
     }
     println!("==> Linking {}", record.name);
     let links = link_tree(prefix, &version_dir, formula_name, overwrite)?;

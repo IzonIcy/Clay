@@ -167,7 +167,10 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             requested,
-            dependencies: dependencies.iter().map(std::string::ToString::to_string).collect(),
+            dependencies: dependencies
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             ..InstallRecord::default()
         }
     }

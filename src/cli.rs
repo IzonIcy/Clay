@@ -299,10 +299,7 @@ impl Cli {
                 let mut matches = Vec::new();
                 for formula in index.formulas() {
                     let name_hit = formula.name.contains(&query);
-                    let desc_hit = formula
-                        .desc
-                        .as_ref()
-                        .is_some_and(|d| d.contains(&query));
+                    let desc_hit = formula.desc.as_ref().is_some_and(|d| d.contains(&query));
                     if name_hit || (desc && desc_hit) {
                         matches.push(formula);
                         if matches.len() >= limit {
@@ -573,7 +570,10 @@ mod tests {
             homepage: None,
             license: None,
             dependencies: deps.iter().map(std::string::ToString::to_string).collect(),
-            recommended_dependencies: recommended.iter().map(std::string::ToString::to_string).collect(),
+            recommended_dependencies: recommended
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             optional_dependencies: Vec::new(),
             build_dependencies: Vec::new(),
             test_dependencies: Vec::new(),
