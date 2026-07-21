@@ -211,7 +211,7 @@ impl Cli {
                     let formula = resolve_formula_record(&index, &name)?;
                     if let Some(latest) = formula.version() {
                         if compare_versions(&installed, &latest).is_lt() {
-                            println!("{} {} -> {}", name, installed, latest);
+                            println!("{name} {installed} -> {latest}");
                         }
                     }
                 }
@@ -227,7 +227,7 @@ impl Cli {
                 };
                 for name in targets {
                     if registry.is_pinned(&name) {
-                        println!("{} is pinned; skipping upgrade", name);
+                        println!("{name} is pinned; skipping upgrade");
                         continue;
                     }
                     let formula_record = resolve_formula_record(&index, &name)?;
@@ -302,8 +302,7 @@ impl Cli {
                     let desc_hit = formula
                         .desc
                         .as_ref()
-                        .map(|d| d.contains(&query))
-                        .unwrap_or(false);
+                        .is_some_and(|d| d.contains(&query));
                     if name_hit || (desc && desc_hit) {
                         matches.push(formula);
                         if matches.len() >= limit {
@@ -396,16 +395,16 @@ fn print_formula_info(record: &FormulaRecord, prefix: &std::path::Path) -> Resul
     let installed = list_installed_versions(prefix, formula_name(record))?;
     println!("name: {}", record.name);
     if let Some(desc) = &record.desc {
-        println!("desc: {}", desc);
+        println!("desc: {desc}");
     }
     if let Some(homepage) = &record.homepage {
-        println!("homepage: {}", homepage);
+        println!("homepage: {homepage}");
     }
     if let Some(version) = record.version() {
-        println!("version: {}", version);
+        println!("version: {version}");
     }
     if let Some(license) = &record.license {
-        println!("license: {}", license);
+        println!("license: {license}");
     }
     let deps = record.dependencies(false);
     if !deps.is_empty() {
@@ -529,7 +528,7 @@ fn build_install_plan(
             return Ok(());
         }
         if !visiting.insert(name.to_string()) {
-            bail!("dependency cycle detected at {}", name);
+            bail!("dependency cycle detected at {name}");
         }
         let record = resolver.resolve(name)?;
         for dep in record.dependencies(include_recommended) {
@@ -573,8 +572,8 @@ mod tests {
             desc: None,
             homepage: None,
             license: None,
-            dependencies: deps.iter().map(|dep| dep.to_string()).collect(),
-            recommended_dependencies: recommended.iter().map(|dep| dep.to_string()).collect(),
+            dependencies: deps.iter().map(std::string::ToString::to_string).collect(),
+            recommended_dependencies: recommended.iter().map(std::string::ToString::to_string).collect(),
             optional_dependencies: Vec::new(),
             build_dependencies: Vec::new(),
             test_dependencies: Vec::new(),
@@ -610,7 +609,8 @@ mod tests {
         let root = formula("root", &[], &["recommended"]);
         let index = index(vec![root.clone(), formula("recommended", &[], &[])]);
         let mut resolver = FormulaResolver::new(&index);
-        let plan = build_install_plan(&root, &mut resolver, true).unwrap();
+        let plan = build_install_plan(&root, &mut resolver, true)
+            .expect("install plan should be buildable");
         let names: Vec<String> = plan.into_iter().map(|record| record.name).collect();
 
         assert_eq!(names, vec!["recommended", "root"]);

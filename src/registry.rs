@@ -32,7 +32,7 @@ impl Default for InstallRecord {
     }
 }
 
-fn default_requested() -> bool {
+const fn default_requested() -> bool {
     true
 }
 
@@ -167,7 +167,7 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             requested,
-            dependencies: dependencies.iter().map(|dep| dep.to_string()).collect(),
+            dependencies: dependencies.iter().map(std::string::ToString::to_string).collect(),
             ..InstallRecord::default()
         }
     }

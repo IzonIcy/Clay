@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 const FORMULA_API: &str = "https://formulae.brew.sh/api/formula.json";
 const INDEX_CACHE_NAME: &str = "formula.json";
-const INDEX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24);
+const INDEX_MAX_AGE: Duration = Duration::from_hours(24);
 const USER_AGENT: &str = "clay/0.1 (+https://github.com)";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -158,7 +158,7 @@ impl FormulaIndex {
 
     fn fetch_remote_raw() -> Result<String> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_mins(1))
             .user_agent(USER_AGENT)
             .build()
             .context("building HTTP client")?;

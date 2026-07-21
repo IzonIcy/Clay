@@ -19,15 +19,13 @@ pub fn run_doctor() -> Result<()> {
     let git_ok = std::process::Command::new("git")
         .arg("--version")
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     println!("git: {}", if git_ok { "ok" } else { "missing" });
 
     let brew_ok = std::process::Command::new("brew")
         .arg("--version")
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     println!("brew: {}", if brew_ok { "ok" } else { "missing" });
 
     let write_test = registry_path(&prefix).with_extension("write_test");
@@ -53,26 +51,26 @@ pub fn run_doctor() -> Result<()> {
     }
 
     let collisions = count_link_collisions(&prefix)?;
-    println!("link collisions: {}", collisions);
+    println!("link collisions: {collisions}");
     let broken = count_broken_links(&prefix)?;
-    println!("broken links: {}", broken);
+    println!("broken links: {broken}");
 
     let registry = Registry::load(&registry_path(&prefix))?;
     let mut missing_cellar = 0usize;
     let mut missing_links = 0usize;
-    for entry in registry.installs.iter() {
+    for entry in &registry.installs {
         let cellar_path = cellar(&prefix).join(&entry.name).join(&entry.version);
         if !cellar_path.exists() {
             missing_cellar += 1;
         }
-        for link in entry.links.iter() {
+        for link in &entry.links {
             if !link.exists() {
                 missing_links += 1;
             }
         }
     }
-    println!("registry entries missing cellar: {}", missing_cellar);
-    println!("registry links missing: {}", missing_links);
+    println!("registry entries missing cellar: {missing_cellar}");
+    println!("registry links missing: {missing_links}");
     Ok(())
 }
 
@@ -135,6 +133,6 @@ fn format_bytes(bytes: u64) -> String {
     } else if bytes_f >= KB {
         format!("{:.1} KB", bytes_f / KB)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }

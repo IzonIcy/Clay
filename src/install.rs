@@ -267,12 +267,12 @@ pub fn link_formula(
     let version = resolve_version(prefix, name, version)?;
     let version_dir = cellar(prefix).join(name).join(&version);
     if !version_dir.exists() {
-        bail!("{} {} is not installed", name, version);
+        bail!("{name} {version} is not installed");
     }
     let new_links = link_tree(prefix, &version_dir, name, overwrite)?;
     let mut registry = Registry::load(&registry_path(prefix))?;
     let mut matched = false;
-    for entry in registry.installs.iter_mut() {
+    for entry in &mut registry.installs {
         if entry.name == name && entry.version == version {
             merge_links(&mut entry.links, &new_links);
             matched = true;
@@ -282,7 +282,7 @@ pub fn link_formula(
     if !matched {
         registry.installs.push(InstallRecord {
             name: name.to_string(),
-            version: version.clone(),
+            version,
             platform: "unknown".to_string(),
             installed_at: Utc::now().to_rfc3339(),
             links: new_links.clone(),
@@ -300,9 +300,9 @@ pub fn unlink_formula(prefix: &Path, name: &str, version: Option<&str>) -> Resul
     let mut registry = Registry::load(&registry_path)?;
     let mut removed = 0usize;
     if !registry.installs.is_empty() {
-        for entry in registry.installs.iter_mut() {
+        for entry in &mut registry.installs {
             let matches_name = entry.name == name;
-            let matches_version = version.map(|v| v == entry.version).unwrap_or(true);
+            let matches_version = version.is_none_or(|v| v == entry.version);
             if matches_name && matches_version {
                 removed += unlink_paths(&entry.links)?;
                 entry.links.clear();
@@ -444,25 +444,22 @@ fn link_tree(
             if link_path.exists() {
                 let metadata = std::fs::symlink_metadata(&link_path)?;
                 if metadata.file_type().is_symlink() {
-                    match std::fs::read_link(&link_path) {
-                        Ok(target) => {
-                            if target.to_string_lossy().contains(&needle) {
-                                std::fs::remove_file(&link_path).with_context(|| {
-                                    format!("removing link {}", link_path.display())
-                                })?;
-                            } else if overwrite {
-                                std::fs::remove_file(&link_path).with_context(|| {
-                                    format!("removing link {}", link_path.display())
-                                })?;
-                            } else {
-                                conflicts.push(link_path);
-                                continue;
-                            }
-                        }
-                        Err(_) => {
+                    if let Ok(target) = std::fs::read_link(&link_path) {
+                        if target.to_string_lossy().contains(&needle) {
+                            std::fs::remove_file(&link_path).with_context(|| {
+                                format!("removing link {}", link_path.display())
+                            })?;
+                        } else if overwrite {
+                            std::fs::remove_file(&link_path).with_context(|| {
+                                format!("removing link {}", link_path.display())
+                            })?;
+                        } else {
                             conflicts.push(link_path);
                             continue;
                         }
+                    } else {
+                        conflicts.push(link_path);
+                        continue;
                     }
                 } else {
                     conflicts.push(link_path);
@@ -651,9 +648,7 @@ fn install_from_source(
     let version_dir = cellar(prefix).join(formula_name).join(&version);
     if !version_dir.exists() {
         bail!(
-            "{} {} is not installed after source build",
-            formula_name,
-            version
+            "{formula_name} {version} is not installed after source build"
         );
     }
     println!("==> Linking {}", record.name);

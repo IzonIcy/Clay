@@ -72,7 +72,7 @@ fn macos_bottle_tag() -> Option<&'static str> {
     macos_bottle_tag_for_major(major)
 }
 
-fn macos_bottle_tag_for_major(major: u32) -> Option<&'static str> {
+const fn macos_bottle_tag_for_major(major: u32) -> Option<&'static str> {
     match major {
         26.. => Some("tahoe"),
         15 => Some("sequoia"),

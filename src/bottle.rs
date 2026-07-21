@@ -8,7 +8,7 @@ use std::time::Duration;
 use tar::{Archive, EntryType};
 
 const USER_AGENT: &str = "clay/0.1 (+https://github.com)";
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(2);
 const DOWNLOAD_RETRIES: usize = 3;
 
 pub fn download(url: &str, dest: &Path) -> Result<()> {
@@ -190,7 +190,7 @@ fn sha256_hex_reader<R: io::Read>(mut reader: R) -> Result<String> {
     let result = hasher.finalize();
     let mut out = String::with_capacity(64);
     for byte in result {
-        let _ = write!(out, "{:02x}", byte);
+        let _ = write!(out, "{byte:02x}");
     }
     Ok(out)
 }
