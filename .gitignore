@@ -7,3 +7,4 @@ opencode.json
 # Agent instruction files
 AGENTS.md
 CLAUDE.md
+.github/copilot-instructions.md
