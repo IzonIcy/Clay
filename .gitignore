@@ -3,3 +3,7 @@ target/
 
 # OpenCode config
 opencode.json
+
+# Agent instruction files
+AGENTS.md
+CLAUDE.md
