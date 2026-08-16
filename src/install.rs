@@ -441,7 +441,7 @@ fn link_tree(
             let path = entry.path();
             let file_name = entry.file_name();
             let link_path = to_dir.join(file_name);
-            if link_path.exists() {
+            if link_path.symlink_metadata().is_ok() {
                 let metadata = std::fs::symlink_metadata(&link_path)?;
                 if metadata.file_type().is_symlink() {
                     if let Ok(target) = std::fs::read_link(&link_path) {
