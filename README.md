@@ -1,5 +1,7 @@
 # Clay
 
+[![CI](https://github.com/IzonIcy/Clay/actions/workflows/ci.yml/badge.svg)](https://github.com/IzonIcy/Clay/actions/workflows/ci.yml)
+
 Clay is a fast Homebrew-compatible package manager built in Rust.
 
 Clay is early-stage software. The core CLI is in place, including formula lookup through Homebrew's JSON API, bottle downloads, checksum verification, dependency planning, registry tracking, and linking for `bin`, `lib`, `include`, and `share`.
