@@ -64,6 +64,14 @@ pub fn prefetch_bottles(
         });
     }
 
+    // One shared bar across the parallel downloads; each finished task ticks it.
+    let progress = indicatif::ProgressBar::new(tasks.len() as u64)
+        .with_style(
+            indicatif::ProgressStyle::with_template("fetching [{bar:24}] {pos}/{len} {msg}")
+                .expect("valid progress template"),
+        )
+        .with_message("bottles");
+
     tasks.par_iter().try_for_each(|task| -> Result<()> {
         if !task.tarball.exists() {
             bottle::download(&task.url, &task.tarball)
@@ -71,9 +79,11 @@ pub fn prefetch_bottles(
         }
         bottle::verify_sha256(&task.tarball, &task.sha256)
             .with_context(|| format!("verifying {}", task.name))?;
+        progress.inc(1);
         Ok(())
     })?;
 
+    progress.finish_and_clear();
     Ok(())
 }
 
@@ -205,6 +215,92 @@ pub fn uninstall_formula(name: &str, prefix: &Path, ignore_dependencies: bool) -
     registry.save(&registry_path)?;
     unlink_links_for_formula(prefix, name)?;
     Ok(())
+}
+
+pub fn rollback_formula(prefix: &Path, name: &str, target_version: Option<&str>) -> Result<String> {
+    let _lock = acquire_install_lock(prefix)?;
+    let registry_path = registry_path(prefix);
+    let mut registry = Registry::load(&registry_path)?;
+
+    let versions = list_versions_from_cellar(prefix, name)?;
+    if versions.is_empty() {
+        bail!("{name} is not installed");
+    }
+
+    // Current = newest known version (registry entry wins over cellar scan).
+    let current = {
+        let mut candidates: Vec<String> = registry
+            .entries_for(name)
+            .into_iter()
+            .map(|e| e.version)
+            .collect();
+        candidates.sort_by(|a, b| compare_versions(a, b));
+        match candidates.last() {
+            Some(latest) => latest.clone(),
+            None => versions
+                .last()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no installed versions for {name}"))?,
+        }
+    };
+
+    let older: Vec<String> = versions
+        .iter()
+        .filter(|v| compare_versions(v, &current) == std::cmp::Ordering::Less)
+        .cloned()
+        .collect();
+    if older.is_empty() {
+        bail!("{name} {current} is the oldest version in the cellar; nothing to roll back to");
+    }
+
+    let target = match target_version {
+        Some(requested) => {
+            if !older.iter().any(|v| v == requested) {
+                bail!(
+                    "{name} {requested} is not an older version in the cellar (available: {})",
+                    older.join(", ")
+                );
+            }
+            requested.to_string()
+        }
+        None => older.last().cloned().expect("checked non-empty above"),
+    };
+
+    // Preserve metadata from the current entry before clearing its links.
+    let previous_entry = registry
+        .entries_for(name)
+        .into_iter()
+        .find(|entry| entry.version == current);
+
+    for entry in registry.entries_for(name) {
+        unlink_paths(&entry.links)?;
+    }
+    registry
+        .installs
+        .retain(|entry| !(entry.name == name && entry.version != target));
+
+    let version_dir = cellar(prefix).join(name).join(&target);
+    println!("==> Rolling back {name} to {target}");
+    let links = link_tree(prefix, &version_dir, name, false)?;
+
+    registry.upsert(InstallRecord {
+        name: name.to_string(),
+        version: target.clone(),
+        platform: previous_entry
+            .as_ref()
+            .map(|e| e.platform.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        installed_at: Utc::now().to_rfc3339(),
+        links,
+        dependencies: previous_entry
+            .as_ref()
+            .map(|e| e.dependencies.clone())
+            .unwrap_or_default(),
+        requested: previous_entry.as_ref().map(|e| e.requested).unwrap_or(true),
+    });
+    registry.save(&registry_path)?;
+
+    Ok(target)
 }
 
 pub fn list_installed(prefix: &Path) -> Result<Vec<String>> {

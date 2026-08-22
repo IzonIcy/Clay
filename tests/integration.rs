@@ -269,3 +269,64 @@ fn registry_roundtrips_through_disk() {
         Registry::load(&registry_path(&prefix).with_extension("nope")).expect("load missing");
     assert!(empty.installs.is_empty());
 }
+
+#[test]
+fn rollback_switches_to_previous_version_and_relinks() {
+    let (_dir, prefix) = fake_prefix();
+
+    // Cellar holds 1.20 and 1.21; registry says 1.21 is linked.
+    make_cellar_file(&prefix, "wget", "1.20", "bin/wget");
+    make_cellar_file(&prefix, "wget", "1.21", "bin/wget");
+    save_registry(
+        prefix.as_path(),
+        vec![install_record("wget", "1.21", true, &["openssl@3"])],
+    );
+
+    let target = clay::install::rollback_formula(&prefix, "wget", None)
+        .expect("rollback to previous version");
+    assert_eq!(target, "1.20");
+
+    // Links now point into the 1.20 tree.
+    let link_path = prefix.join("bin").join("wget");
+    assert!(
+        link_path.symlink_metadata().is_ok(),
+        "link should exist after rollback"
+    );
+    let link_target = fs::read_link(&link_path).expect("read link");
+    assert!(link_target.to_string_lossy().contains("Cellar/wget/1.20"));
+
+    // Registry keeps one entry with the rolled-back version and metadata.
+    let registry = Registry::load(&registry_path(&prefix)).expect("load registry");
+    assert_eq!(registry.installs.len(), 1);
+    assert_eq!(registry.installs[0].version, "1.20");
+    assert_eq!(registry.installs[0].dependencies, vec!["openssl@3"]);
+    assert!(registry.installs[0].requested);
+
+    // Explicit target version works and rejects unknown ones.
+    make_cellar_file(&prefix, "wget", "1.19", "bin/wget");
+    let explicit =
+        clay::install::rollback_formula(&prefix, "wget", Some("1.19")).expect("explicit rollback");
+    assert_eq!(explicit, "1.19");
+
+    assert!(
+        clay::install::rollback_formula(&prefix, "wget", Some("9.9")).is_err(),
+        "unknown version must be rejected"
+    );
+}
+
+#[test]
+fn rollback_fails_when_nothing_older_exists() {
+    let (_dir, prefix) = fake_prefix();
+    make_cellar_file(&prefix, "jq", "1.7", "bin/jq");
+    save_registry(
+        prefix.as_path(),
+        vec![install_record("jq", "1.7", true, &[])],
+    );
+
+    let error = clay::install::rollback_formula(&prefix, "jq", None)
+        .expect_err("nothing older to roll back to");
+    assert!(
+        error.to_string().contains("nothing to roll back to"),
+        "unexpected error: {error}"
+    );
+}

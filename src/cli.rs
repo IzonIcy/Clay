@@ -3,8 +3,8 @@ use crate::doctor::run_doctor;
 use crate::formula::{FormulaIndex, FormulaRecord};
 use crate::install::{
     autoremove, cleanup, install_formula, is_installed, link_formula, list_installed_versions,
-    list_installed_with_versions, prefetch_bottles, uninstall_formula, unlink_formula,
-    InstallOptions,
+    list_installed_with_versions, prefetch_bottles, rollback_formula, uninstall_formula,
+    unlink_formula, InstallOptions,
 };
 use crate::prefix::{default_platform, default_prefix, registry_path};
 use crate::registry::Registry;
@@ -96,6 +96,15 @@ enum Commands {
     Doctor,
     Leaves,
     Autoremove,
+    Rollback {
+        formula: String,
+        #[arg(long, help = "Roll back to this specific older version")]
+        version: Option<String>,
+    },
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     Pin {
         formula: String,
     },
@@ -353,6 +362,15 @@ impl Cli {
             },
             Commands::Doctor => {
                 run_doctor()?;
+            }
+            Commands::Rollback { formula, version } => {
+                let prefix = default_prefix()?;
+                let target = rollback_formula(&prefix, &formula, version.as_deref())?;
+                println!("rolled back {formula} to {target}");
+            }
+            Commands::Completions { shell } => {
+                let mut cmd = <Cli as clap::CommandFactory>::command();
+                clap_complete::generate(shell, &mut cmd, "clay", &mut std::io::stdout());
             }
             Commands::Leaves => {
                 let prefix = default_prefix()?;
