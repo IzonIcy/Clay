@@ -16,6 +16,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Match rust-toolchain.toml so rustup doesn't resolve cargo commands
+          # to an unpinned toolchain missing these components.
+          toolchain: "1.96.0"
           components: clippy, rustfmt
 
       - name: Cache cargo artifacts
