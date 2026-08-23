@@ -25,5 +25,13 @@ pub fn acquire_install_lock(prefix: &Path) -> Result<std::fs::File> {
 
 #[cfg(not(target_family = "unix"))]
 pub fn acquire_install_lock(_prefix: &Path) -> Result<()> {
-    Ok(())
+    // Silent no-op was worse than no function: two concurrent installs on
+    // Windows could interleave registry writes and linking, corrupting the
+    // very state `rollback` depends on. Fail loudly until LockFileEx support
+    // lands — refusing to run is recoverable; a corrupt registry is not.
+    anyhow::bail!(
+        "install locking is not implemented on this platform yet; \
+         refusing to run concurrent-unsafe installs. \
+         Only one clay install process may run at a time on Windows."
+    )
 }

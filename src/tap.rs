@@ -18,6 +18,12 @@ pub fn add_tap(repo: &str) -> Result<()> {
         bail!("tap {repo} already exists");
     }
     let url = format!("https://github.com/{user}/homebrew-{name}.git");
+    eprintln!(
+        "Trust warning: adding tap {repo} lets the owner of that repository \
+         supply formulae — including download URLs and sha256 checksums — \
+         which clay will fetch and install on your machine. Pin or audit \
+         taps you do not personally control."
+    );
     let status = Command::new("git")
         .arg("clone")
         .arg(url)

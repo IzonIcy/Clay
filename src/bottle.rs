@@ -11,6 +11,20 @@ const USER_AGENT: &str = "clay/0.1 (+https://github.com)";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(2);
 const DOWNLOAD_RETRIES: usize = 3;
 
+/// One shared HTTP client for the process: building a client per attempt (or
+/// per bottle) re-does TLS setup and loses connection reuse across the
+/// parallel downloads install.rs fans out.
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(DOWNLOAD_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("building shared HTTP client with static config cannot fail")
+    })
+}
+
 pub fn download(url: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -19,7 +33,7 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
 
     let mut last_error = None;
     for attempt in 1..=DOWNLOAD_RETRIES {
-        match download_once(url, dest) {
+        match download_once(http_client(), url, dest) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_error = Some(err);
@@ -33,12 +47,7 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
     Err(last_error.expect("download attempted at least once"))
 }
 
-fn download_once(url: &str, dest: &Path) -> Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .context("building HTTP client")?;
+fn download_once(client: &reqwest::blocking::Client, url: &str, dest: &Path) -> Result<()> {
     let mut response = client
         .get(url)
         .send()
