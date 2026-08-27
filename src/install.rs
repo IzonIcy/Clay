@@ -22,6 +22,23 @@ pub struct AutoRemoveReport {
     pub removed_links: usize,
 }
 
+/// Formula names and versions become path components under the Cellar and
+/// cache dir. Names come from the Homebrew API and from third-party tap
+/// JSON, so reject anything that could escape those roots before it is
+/// ever joined onto a path.
+pub(crate) fn validate_path_component(kind: &str, value: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && !value.starts_with('.')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_' | '@' | '.'));
+    if valid {
+        Ok(())
+    } else {
+        bail!("invalid formula {kind}: {value:?}");
+    }
+}
+
 pub struct InstallOptions<'a> {
     pub platform: Option<&'a str>,
     pub force: bool,
@@ -136,6 +153,8 @@ pub fn install_formula(
     let version = record
         .version()
         .ok_or_else(|| anyhow::anyhow!("missing stable version"))?;
+    validate_path_component("name", formula_name)?;
+    validate_path_component("version", &version)?;
 
     let cellar_root = cellar(prefix);
     ensure_dir(&cellar_root)?;
@@ -206,13 +225,16 @@ pub fn uninstall_formula(name: &str, prefix: &Path, ignore_dependencies: bool) -
             );
         }
     }
-    std::fs::remove_dir_all(&install_root)
-        .with_context(|| format!("removing {}", install_root.display()))?;
+    // Unlink from the registry BEFORE deleting the Cellar: remove_file on a
+    // broken symlink fails its exists() probe, so deleting first would leave
+    // every recorded link behind.
     for entry in registry.entries_for(name) {
         unlink_paths(&entry.links)?;
     }
     registry.remove(name);
     registry.save(&registry_path)?;
+    std::fs::remove_dir_all(&install_root)
+        .with_context(|| format!("removing {}", install_root.display()))?;
     unlink_links_for_formula(prefix, name)?;
     Ok(())
 }
@@ -586,7 +608,9 @@ fn link_tree(
 fn unlink_paths(paths: &[std::path::PathBuf]) -> Result<usize> {
     let mut removed = 0usize;
     for path in paths {
-        if path.exists() {
+        // symlink_metadata, not exists(): a link whose target is already
+        // gone still needs removing, and exists() returns false for it.
+        if std::fs::symlink_metadata(path).is_ok() {
             std::fs::remove_file(path)
                 .with_context(|| format!("removing link {}", path.display()))?;
             removed += 1;
@@ -759,4 +783,24 @@ fn install_from_source(
     });
     registry.save(&registry_path(prefix))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_path_component;
+
+    #[test]
+    fn accepts_typical_homebrew_names_and_versions() {
+        validate_path_component("name", "openssl@3").unwrap();
+        validate_path_component("name", "gnu-sed").unwrap();
+        validate_path_component("version", "1.2.3").unwrap();
+        validate_path_component("version", "20260815").unwrap();
+    }
+
+    #[test]
+    fn rejects_components_that_escape_the_cellar() {
+        for bad in ["..", ".", "foo/bar", "", "a b"] {
+            assert!(validate_path_component("name", bad).is_err(), "{bad:?}");
+        }
+    }
 }

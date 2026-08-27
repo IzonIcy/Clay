@@ -240,6 +240,16 @@ impl Cli {
                         continue;
                     }
                     let formula_record = resolve_formula_record(&index, &name)?;
+                    let installed = list_installed_versions(&prefix, &name)?.last().cloned();
+                    // Skip targets already up to date — force-installing
+                    // every formula on every `clay upgrade` re-downloaded
+                    // and re-poured the whole Cellar.
+                    if let (Some(installed), Some(latest)) = (installed, formula_record.version()) {
+                        if !compare_versions(&installed, &latest).is_lt() {
+                            println!("{name} {installed} is up to date");
+                            continue;
+                        }
+                    }
                     let requested = registry
                         .entries_for(&name)
                         .iter()
@@ -305,18 +315,19 @@ impl Cli {
             Commands::Search { query, limit, desc } => {
                 let prefix = default_prefix()?;
                 let index = FormulaIndex::load(&prefix)?;
-                let mut matches = Vec::new();
-                for formula in index.formulas() {
-                    let name_hit = formula.name.contains(&query);
-                    let desc_hit = formula.desc.as_ref().is_some_and(|d| d.contains(&query));
-                    if name_hit || (desc && desc_hit) {
-                        matches.push(formula);
-                        if matches.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-                for formula in matches {
+                // HashMap iteration order is randomized per process; collect
+                // everything first and sort so `--limit` cuts a stable set.
+                let mut matches: Vec<_> = index
+                    .formulas()
+                    .filter(|formula| {
+                        let name_hit = formula.name.contains(&query);
+                        let desc_hit = formula.desc.as_ref().is_some_and(|d| d.contains(&query));
+                        name_hit || (desc && desc_hit)
+                    })
+                    .collect();
+                matches.sort_by(|a, b| a.name.cmp(&b.name));
+                matches.truncate(limit);
+                for formula in &matches {
                     if desc {
                         let desc = formula.desc.as_deref().unwrap_or("");
                         println!("{} - {}", formula.name, desc);

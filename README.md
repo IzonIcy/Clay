@@ -34,6 +34,8 @@ clay tap add <user/repo>
 clay tap list
 clay tap update
 clay tap remove <user/repo>
+clay rollback <formula> [--version <ver>]
+clay completions <shell>
 clay cache clean
 clay doctor
 clay leaves
