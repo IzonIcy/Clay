@@ -1,0 +1,22 @@
+[allowlist]
+description = "Gitleaks allowlist for Clay"
+files = [
+  "(.*?)(test|spec|mock|fixture)(.*?)\\.(rs|toml)$",
+]
+commits = []
+paths = []
+
+[[rules]]
+description = "Generic API Key"
+regex = '''(?i)(api[_-]?key|apikey)\\s*[:=]\\s*["']?[a-zA-Z0-9\\-_]{20,}["']?'''
+tags = ["key", "api"]
+
+[[rules]]
+description = "Generic Secret"
+regex = '''(?i)(secret|password|passwd|pwd)\\s*[:=]\\s*["']?[a-zA-Z0-9\\-_]{8,}["']?'''
+tags = ["secret", "password"]
+
+[[rules]]
+description = "Rust cargo registry token"
+regex = '''(?i)cargo[_-]?registry[_-]?token\\s*[:=]\\s*["']?[a-zA-Z0-9\\-_]{20,}["']?'''
+tags = ["cargo", "token"]

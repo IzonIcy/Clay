@@ -16,6 +16,36 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 
+/**
+ * CLAY — Fast Homebrew-Compatible Package Manager
+ *
+ * FLAGSHIP PROJECT (Pillar 2: Developer Tooling)
+ *
+ * DECISION: This is your ONE devtool flagship. Spine (meta-pkg-mgr) and Lumi-Term (terminal)
+ * should be archived. Focus here.
+ *
+ * STRATEGIC TODOs FOR AI AGENT:
+ * [ ] PHASE 1: PRODUCTION HARDENING
+ *     - Binary releases: GitHub Actions → build Linux/macOS/Windows binaries
+ *     - Homebrew tap: publish `brew install ryanbahadori/tap/clay`
+ *     - Shell completions: already done, verify all shells (bash, zsh, fish, powershell)
+ *     - Integration tests: testcontainers (Docker) for install/link/upgrade flows
+ * [ ] PHASE 2: DIFFERENTIATION (Why Clay over Homebrew?)
+ *     - Parallel downloads: concurrent bottle fetching (rayon + reqwest)
+ *     - Better UX: progress bars (indicatif), colored output, dry-run by default
+ *     - Dependency visualization: `clay depgraph <formula>` → mermaid/DOT output
+ *     - Lockfile: `clay.lock` for reproducible environments (like Cargo.lock)
+ * [ ] PHASE 3: ECOSYSTEM
+ *     - Plugin system: custom formula sources (GitHub Releases, Cargo, npm, PyPI)
+ *     - Workspace support: monorepo-aware (detect Cargo.toml, package.json, go.mod)
+ *     - CI integration: `clay ci` → installs deps, caches, outputs GitHub Actions cache key
+ * [ ] IMMEDIATE:
+ *     - Add cargo-audit to CI (security scanning)
+ *     - Benchmark: `clay install` vs `brew install` on 50 packages
+ *     - Write blog: "Building a Package Manager in Rust: Dependency Resolution Deep Dive"
+ *     - Submit to Rust Weekly / This Week in Rust
+ */
+
 #[derive(Parser, Debug)]
 #[command(name = "clay")]
 #[command(about = "Fast Homebrew-compatible package manager", long_about = None)]
