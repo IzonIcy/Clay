@@ -201,6 +201,17 @@ impl Cli {
                     return Ok(());
                 }
 
+                // Prefetch all bottles in parallel with progress bars
+                let bottles: Vec<FormulaRecord> = install_plan
+                    .iter()
+                    .filter_map(|(record, _, _)| Some(record.clone()))
+                    .collect();
+                if !bottles.is_empty() {
+                    let prefix_clone = prefix.clone();
+                    let platform_clone = platform.clone();
+                    prefetch_bottles(&bottles, &prefix_clone, platform_clone.as_deref())?;
+                }
+
                 for (record, is_root, should_force) in install_plan {
                     install_formula(
                         &record,
