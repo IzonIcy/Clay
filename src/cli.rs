@@ -141,6 +141,9 @@ enum Commands {
     Unpin {
         formula: String,
     },
+    Depgraph {
+        formula: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -441,6 +444,24 @@ impl Cli {
                 registry.unpin(&formula);
                 registry.save(&registry_path(&prefix))?;
                 println!("unpinned {formula}");
+            }
+            Commands::Depgraph { formula } => {
+                // Simple depgraph: print the formula and its direct dependencies
+                let index = FormulaIndex::load(&default_prefix()?)?;
+                if let Ok(record) = index.get(&formula) {
+                    println!("Formula: {}", record.name);
+                    if !record.dependencies(false).is_empty() {
+                        println!("Direct dependencies:");
+                        for dep in &record.dependencies(false) {
+                            let clean = dep.split('/').next_back().unwrap_or(&dep);
+                            println!("  - {clean}");
+                        }
+                    } else {
+                        println!("Formula '{}' not found", formula);
+                    }
+                } else {
+                    println!("Formula '{}' not found", formula);
+                }
             }
         }
         Ok(())
